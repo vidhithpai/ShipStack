@@ -1,4 +1,4 @@
-# DeployMate
+# ShipStack
 
 Mini Platform-as-a-Service (PaaS) that runs locally and on AWS EC2. Deploy GitHub repos as Docker containers with one click.
 
@@ -66,7 +66,7 @@ Frontend runs at `http://localhost:5173` and proxies `/api` to the backend.
 ## Project structure
 
 ```
-deploymate/
+shipstack/
 ├── backend/
 │   ├── src/
 │   │   ├── controllers/
