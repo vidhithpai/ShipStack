@@ -10,7 +10,26 @@ function validateAndSanitizeGitHubUrl(input) {
     throw new Error('Repository URL is required');
   }
 
-  let url = input.trim();
+  const raw = input.trim();
+
+  // Explicitly reject common non-HTTPS / local patterns early with clear messages
+  if (/^(git@|ssh:\/\/)/i.test(raw)) {
+    throw new Error('SSH Git URLs are not allowed. Use an HTTPS GitHub URL starting with https://github.com/');
+  }
+  if (/^file:\/\//i.test(raw)) {
+    throw new Error('file:// URLs are not allowed. Use a public GitHub repository URL.');
+  }
+  if (/^([a-zA-Z]:\\|\\\\|\/)/.test(raw)) {
+    throw new Error('Local filesystem paths are not allowed. Use a public GitHub repository URL.');
+  }
+
+  // Regex-level guard: must start with https://github.com/
+  const githubPrefixRegex = /^https:\/\/github\.com\//i;
+  if (!githubPrefixRegex.test(raw)) {
+    throw new Error('Repository URL must start with https://github.com/');
+  }
+
+  let url = raw;
 
   // Must be a valid URL format
   if (!validator.isURL(url, { require_protocol: true })) {
@@ -40,9 +59,15 @@ function validateAndSanitizeGitHubUrl(input) {
     throw new Error('URL must be in format: https://github.com/owner/repo');
   }
 
+  // Secondary regex guard to avoid odd cases with query/fragment
+  const finalUrl = `https://github.com/${pathMatch[1]}/${pathMatch[2]}`;
+  const githubRepoRegex = /^https:\/\/github\.com\/[^/]+\/[^/]+$/i;
+  if (!githubRepoRegex.test(finalUrl)) {
+    throw new Error('URL must be a GitHub repository in the form https://github.com/owner/repo');
+  }
+
   // Rebuild a clean URL (no fragments, no suspicious query params)
-  const cleanPath = `/${pathMatch[1]}/${pathMatch[2].replace(/\.git$/, '')}`;
-  const sanitized = `https://github.com${cleanPath}.git`;
+  const sanitized = `${finalUrl}.git`;
 
   return sanitized;
 }

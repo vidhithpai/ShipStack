@@ -33,6 +33,14 @@ const deploymentSchema = new mongoose.Schema(
       enum: ['pending', 'building', 'running', 'stopped', 'failed', 'deleted'],
       default: 'pending',
     },
+    frameworkType: {
+      type: String,
+      default: null,
+    },
+    errorMessage: {
+      type: String,
+      default: null,
+    },
     localPath: {
       type: String,
       default: null,
@@ -40,5 +48,14 @@ const deploymentSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+deploymentSchema.statics.Statuses = Object.freeze({
+  PENDING: 'pending',
+  BUILDING: 'building',
+  RUNNING: 'running',
+  FAILED: 'failed',
+  STOPPED: 'stopped',
+  DELETED: 'deleted',
+});
 
 module.exports = mongoose.model('Deployment', deploymentSchema);

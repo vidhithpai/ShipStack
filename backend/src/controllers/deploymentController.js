@@ -48,6 +48,31 @@ async function logs(req, res, next) {
   }
 }
 
+async function buildLogs(req, res, next) {
+  try {
+    const deployment = await deploymentService.getDeploymentById(req.params.id, req.user.id);
+    if (!deployment) {
+      return res.status(404).json({ message: 'Deployment not found' });
+    }
+    const logOutput = await deploymentService.getBuildLogs(req.params.id, req.user.id);
+    res.json({ logs: logOutput || '' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function stats(req, res, next) {
+  try {
+    const result = await deploymentService.getDeploymentStats(req.params.id, req.user.id);
+    if (!result) {
+      return res.status(404).json({ message: 'Deployment not found' });
+    }
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function restart(req, res, next) {
   try {
     const deployment = await deploymentService.restartDeployment(req.params.id, req.user.id);
@@ -63,6 +88,18 @@ async function restart(req, res, next) {
 async function stop(req, res, next) {
   try {
     const deployment = await deploymentService.stopDeployment(req.params.id, req.user.id);
+    if (!deployment) {
+      return res.status(404).json({ message: 'Deployment not found' });
+    }
+    res.json(deployment);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function start(req, res, next) {
+  try {
+    const deployment = await deploymentService.startDeployment(req.params.id, req.user.id);
     if (!deployment) {
       return res.status(404).json({ message: 'Deployment not found' });
     }
@@ -89,7 +126,10 @@ module.exports = {
   list,
   getOne,
   logs,
+  buildLogs,
   restart,
   stop,
+  start,
   remove,
+  stats,
 };

@@ -6,6 +6,8 @@ import {
   restartDeployment,
   stopDeployment,
   deleteDeployment,
+  startDeployment,
+  getDeploymentStats,
 } from '../services/deployments';
 
 export default function DeploymentDetails() {
@@ -17,6 +19,8 @@ export default function DeploymentDetails() {
   const [logsLoading, setLogsLoading] = useState(false);
   const [error, setError] = useState('');
   const [actionLoading, setActionLoading] = useState('');
+  const [stats, setStats] = useState(null);
+  const [statsError, setStatsError] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -44,6 +48,39 @@ export default function DeploymentDetails() {
       .finally(() => { if (!cancelled) setLogsLoading(false); });
     return () => { cancelled = true; };
   }, [id, deployment?.containerId]);
+
+  useEffect(() => {
+    if (!deployment?.containerId || deployment.status !== 'running') {
+      return undefined;
+    }
+    let cancelled = false;
+    let timerId;
+
+    async function poll() {
+      try {
+        const data = await getDeploymentStats(id);
+        if (!cancelled) {
+          setStats(data);
+          setStatsError('');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setStatsError(err.response?.data?.message || 'Failed to load stats');
+        }
+      } finally {
+        if (!cancelled) {
+          timerId = setTimeout(poll, 30000);
+        }
+      }
+    }
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timerId) clearTimeout(timerId);
+    };
+  }, [id, deployment?.containerId, deployment?.status]);
 
   const refreshLogs = async () => {
     setLogsLoading(true);
@@ -82,6 +119,20 @@ export default function DeploymentDetails() {
     }
   };
 
+  const handleStart = async () => {
+    setActionLoading('start');
+    try {
+      const updated = await startDeployment(id);
+      setDeployment(updated);
+      await refreshLogs();
+      setStats(null);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Start failed');
+    } finally {
+      setActionLoading('');
+    }
+  };
+
   const handleDelete = async () => {
     if (!window.confirm('Delete this deployment? Container, image, and files will be removed.')) return;
     setActionLoading('delete');
@@ -99,6 +150,7 @@ export default function DeploymentDetails() {
   if (!deployment) return null;
 
   const canControl = deployment.containerId && deployment.status === 'running';
+  const canStart = deployment.containerId && deployment.status === 'stopped';
 
   return (
     <div className="container">
@@ -144,6 +196,11 @@ export default function DeploymentDetails() {
                 </button>
               </>
             )}
+            {canStart && (
+              <button onClick={handleStart} disabled={!!actionLoading}>
+                {actionLoading === 'start' ? 'Starting…' : 'Start'}
+              </button>
+            )}
             <button className="danger" onClick={handleDelete} disabled={!!actionLoading}>
               {actionLoading === 'delete' ? 'Deleting…' : 'Delete deployment'}
             </button>
@@ -157,6 +214,34 @@ export default function DeploymentDetails() {
           <p style={{ color: 'var(--muted)' }}>Loading logs…</p>
         ) : (
           <pre className="logs">{logs || '(No logs yet)'}</pre>
+        )}
+      </div>
+
+      <div className="card">
+        <strong>Resource stats</strong>
+        {statsError && <div className="errors" style={{ marginTop: '0.5rem' }}>{statsError}</div>}
+        {stats ? (
+          <dl
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'auto 1fr',
+              gap: '0.25rem 1rem',
+              marginTop: '0.5rem',
+            }}
+          >
+            <dt>CPU</dt>
+            <dd>{stats.cpuPercent}</dd>
+            <dt>Memory</dt>
+            <dd>{stats.memoryUsage}</dd>
+            <dt>Limit</dt>
+            <dd>{stats.memoryLimit}</dd>
+            <dt>Status</dt>
+            <dd>{stats.containerStatus}</dd>
+          </dl>
+        ) : (
+          <p style={{ color: 'var(--muted)', marginTop: '0.5rem' }}>
+            Stats will appear here while the deployment is running.
+          </p>
         )}
       </div>
     </div>

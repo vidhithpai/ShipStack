@@ -30,6 +30,16 @@ export async function stopDeployment(id) {
   return data;
 }
 
+export async function startDeployment(id) {
+  const { data } = await api.post(`/deployments/${id}/start`);
+  return data;
+}
+
 export async function deleteDeployment(id) {
   await api.delete(`/deployments/${id}`);
+}
+
+export async function getDeploymentStats(id) {
+  const { data } = await api.get(`/deployments/${id}/stats`);
+  return data;
 }
