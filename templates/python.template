@@ -1,0 +1,15 @@
+# DeployMate Python template - {{PORT}} is injected at deploy time
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PORT={{PORT}}
+EXPOSE {{PORT}}
+
+CMD ["python", "-m", "http.server", "{{PORT}}"]
+# Note: Replace with your app entry (e.g. gunicorn) - app must read PORT from env
