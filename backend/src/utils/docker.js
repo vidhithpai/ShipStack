@@ -102,6 +102,7 @@ async function dockerBuild(arg1, arg2, arg3) {
 
     child.on('error', (err) => {
       appendBuildLog(deploymentId, `\n[build-error] ${err.message}\n`);
+      reject(err);
     });
 
     child.on('close', (code) => {
