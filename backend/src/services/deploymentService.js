@@ -23,6 +23,13 @@ const {
   clearBuildLogs,
   dockerStart,
   dockerContainerExists,
+  dockerComposeUp,
+  dockerComposeStop,
+  dockerComposeDown,
+  dockerComposeServiceNames,
+  dockerComposeContainerIds,
+  dockerComposeLogs,
+  dockerComposePort,
 } = require('../utils/docker');
 
 // Resolve templates from repo root (backend/src/services -> 3 levels up = deploymate)
@@ -160,8 +167,89 @@ async function performHttpHealthCheck(port) {
   });
 }
 
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function detectDeploymentType(projectPath) {
+  const composeYamlPath = path.join(projectPath, 'docker-compose.yml');
+  const composeYmlAltPath = path.join(projectPath, 'docker-compose.yaml');
+  const hasComposeYml = await fileExists(composeYamlPath);
+  const hasComposeYaml = await fileExists(composeYmlAltPath);
+  if (hasComposeYml || hasComposeYaml) {
+    return {
+      deploymentType: 'compose',
+      composeFilePath: hasComposeYml ? composeYamlPath : composeYmlAltPath,
+    };
+  }
+
+  const dockerfilePath = path.join(projectPath, 'Dockerfile');
+  if (await fileExists(dockerfilePath)) {
+    return { deploymentType: 'dockerfile', composeFilePath: null };
+  }
+
+  return { deploymentType: 'generated', composeFilePath: null };
+}
+
+async function validateComposeSecurity(composeFilePath) {
+  const raw = await fs.readFile(composeFilePath, 'utf8');
+  const lower = raw.toLowerCase();
+
+  if (/^\s*privileged\s*:\s*true\s*$/im.test(lower)) {
+    throw new Error('Unsafe docker-compose configuration detected');
+  }
+  if (/^\s*network_mode\s*:\s*["']?host["']?\s*$/im.test(lower)) {
+    throw new Error('Unsafe docker-compose configuration detected');
+  }
+
+  // Reject obvious host root mounts in short/long volume syntaxes.
+  if (/^\s*-\s*["']?\/\s*:[^#\n]+$/im.test(raw) || /^\s*source\s*:\s*["']?\/\s*$/im.test(raw)) {
+    throw new Error('Unsafe docker-compose configuration detected');
+  }
+}
+
+function parseHostPort(portOutput) {
+  if (!portOutput) return null;
+  const firstLine = String(portOutput).split(/\r?\n/).find(Boolean);
+  if (!firstLine) return null;
+  const match = firstLine.match(/:(\d+)\s*$/);
+  return match ? Number(match[1]) : null;
+}
+
+async function resolveComposeHttpPort(projectPath, serviceNames) {
+  const preferredPorts = [
+    parseInt(process.env.INTERNAL_PORT || '3000', 10),
+    80,
+    8080,
+    8000,
+    5000,
+  ];
+
+  for (const serviceName of serviceNames) {
+    for (const containerPort of preferredPorts) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const mapped = await dockerComposePort(projectPath, serviceName, containerPort);
+        const hostPort = parseHostPort(mapped);
+        if (hostPort) {
+          return hostPort;
+        }
+      } catch (_) {
+        // Keep probing known web ports; not every service exposes one.
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
- * Full deployment flow: validate URL, clone, detect stack, generate Dockerfile, build, run, save metadata.
+ * Full deployment flow: validate URL, clone, prioritize compose/dockerfile, then fallback to generated Dockerfile.
  */
 async function createDeployment(userId, repoUrlInput) {
   const repoUrl = validateAndSanitizeGitHubUrl(repoUrlInput);
@@ -199,33 +287,74 @@ async function createDeployment(userId, repoUrlInput) {
       await fs.writeFile(dockerignorePath, dockerignoreContent, 'utf8');
     }
 
-    const detectedStack = await detectStack(deploymentPath);
-    if (!detectedStack || !detectedStack.stackType) {
-      throw new Error('Unsupported project: could not detect stack (need package.json, pom.xml, or requirements.txt)');
+    const { deploymentType, composeFilePath } = await detectDeploymentType(deploymentPath);
+    deployment.deploymentType = deploymentType;
+    deployment.frameworkType = null;
+    await deployment.save();
+
+    if (deploymentType === 'compose') {
+      // Compose deployment must skip stack detection entirely.
+      await validateComposeSecurity(composeFilePath);
+      await dockerComposeUp(deploymentPath);
+
+      const serviceNames = await dockerComposeServiceNames(deploymentPath);
+      const containerIds = await dockerComposeContainerIds(deploymentPath);
+      const assignedPort = await resolveComposeHttpPort(deploymentPath, serviceNames);
+
+      deployment.serviceNames = serviceNames;
+      deployment.containerIds = containerIds;
+      deployment.containerId = containerIds[0] || null;
+      deployment.assignedPort = assignedPort;
+      deployment.status = Deployment.Statuses.BUILDING;
+      deployment.errorMessage = null;
+      await deployment.save();
+
+      // For compose stacks we best-effort check the first exposed HTTP endpoint.
+      if (assignedPort) {
+        const minWaitMs = parseInt(process.env.HEALTHCHECK_INITIAL_DELAY_MS || '2000', 10);
+        await sleep(minWaitMs);
+        await performHttpHealthCheck(assignedPort);
+      }
+    } else {
+      let stackTypeForBuild = deployment.stackType;
+      if (deploymentType === 'generated') {
+        // Stack detection is only required for generated Dockerfiles.
+        const detectedStack = await detectStack(deploymentPath);
+        if (!detectedStack || !detectedStack.stackType) {
+          throw new Error('Unsupported project: could not detect stack (need package.json, pom.xml, or requirements.txt)');
+        }
+        stackTypeForBuild = detectedStack.stackType;
+        deployment.stackType = detectedStack.stackType;
+        deployment.frameworkType = detectedStack.frameworkType || null;
+        await deployment.save();
+
+        const dockerfileContent = await generateDockerfile(detectedStack.stackType, INTERNAL_PORT);
+        const dockerfilePath = path.join(deploymentPath, 'Dockerfile');
+        await fs.writeFile(dockerfilePath, dockerfileContent);
+      } else if (deploymentType === 'dockerfile') {
+        // Preserve current schema requirement while skipping stack detection.
+        stackTypeForBuild = deployment.stackType || 'node';
+      }
+
+      await dockerBuild(String(deployment._id), deploymentPath, imageName);
+
+      const assignedPort = await getNextAvailablePort();
+      const containerId = await dockerRun(imageName, assignedPort, INTERNAL_PORT, containerName);
+
+      deployment.containerId = containerId;
+      deployment.containerIds = containerId ? [containerId] : [];
+      deployment.serviceNames = [];
+      deployment.stackType = stackTypeForBuild;
+      deployment.assignedPort = assignedPort;
+      deployment.status = Deployment.Statuses.BUILDING;
+      deployment.errorMessage = null;
+      await deployment.save();
+
+      // Post-start health check: give the app a short window to boot.
+      const minWaitMs = parseInt(process.env.HEALTHCHECK_INITIAL_DELAY_MS || '2000', 10);
+      await sleep(minWaitMs);
+      await performHttpHealthCheck(assignedPort);
     }
-    deployment.stackType = detectedStack.stackType;
-    deployment.frameworkType = detectedStack.frameworkType || null;
-    await deployment.save();
-
-    const dockerfileContent = await generateDockerfile(detectedStack.stackType, INTERNAL_PORT);
-    const dockerfilePath = path.join(deploymentPath, 'Dockerfile');
-    await fs.writeFile(dockerfilePath, dockerfileContent);
-
-    await dockerBuild(String(deployment._id), deploymentPath, imageName);
-
-    const assignedPort = await getNextAvailablePort();
-    const containerId = await dockerRun(imageName, assignedPort, INTERNAL_PORT, containerName);
-
-    deployment.containerId = containerId;
-    deployment.assignedPort = assignedPort;
-    deployment.status = Deployment.Statuses.BUILDING;
-    deployment.errorMessage = null;
-    await deployment.save();
-
-    // Post-start health check: give the app a short window to boot.
-    const minWaitMs = parseInt(process.env.HEALTHCHECK_INITIAL_DELAY_MS || '2000', 10);
-    await sleep(minWaitMs);
-    await performHttpHealthCheck(assignedPort);
 
     deployment.status = Deployment.Statuses.RUNNING;
     deployment.errorMessage = null;
@@ -253,6 +382,19 @@ async function createDeployment(userId, repoUrlInput) {
  * Cleanup: stop container, remove container, remove image, delete folder, (caller removes DB entry if needed).
  */
 async function cleanupDeployment(deployment) {
+  if (deployment.deploymentType === 'compose' && deployment.localPath) {
+    await dockerComposeDown(deployment.localPath).catch(() => {});
+  }
+
+  if (Array.isArray(deployment.containerIds) && deployment.containerIds.length > 0) {
+    for (const containerId of deployment.containerIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await dockerStop(containerId).catch(() => {});
+      // eslint-disable-next-line no-await-in-loop
+      await dockerRm(containerId).catch(() => {});
+    }
+  }
+
   if (deployment.containerId) {
     await dockerStop(deployment.containerId).catch(() => {});
     await dockerRm(deployment.containerId).catch(() => {});
@@ -270,6 +412,10 @@ async function cleanupDeployment(deployment) {
 async function getLogs(deploymentId, userId, tail) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
+  if (deployment.deploymentType === 'compose') {
+    if (!deployment.localPath) return '';
+    return dockerComposeLogs(deployment.localPath, tail);
+  }
   if (!deployment.containerId) return '';
   return dockerLogs(deployment.containerId, tail);
 }
@@ -277,6 +423,21 @@ async function getLogs(deploymentId, userId, tail) {
 async function restartDeployment(deploymentId, userId) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
+  if (deployment.deploymentType === 'compose') {
+    if (!deployment.localPath) {
+      const err = new Error('No compose project path to restart');
+      err.statusCode = 400;
+      throw err;
+    }
+    await dockerComposeStop(deployment.localPath);
+    await dockerComposeUp(deployment.localPath);
+    deployment.containerIds = await dockerComposeContainerIds(deployment.localPath);
+    deployment.containerId = deployment.containerIds[0] || null;
+    deployment.status = Deployment.Statuses.RUNNING;
+    deployment.errorMessage = null;
+    await deployment.save();
+    return deployment;
+  }
   if (!deployment.containerId) {
     const err = new Error('No container to restart');
     err.statusCode = 400;
@@ -292,6 +453,15 @@ async function restartDeployment(deploymentId, userId) {
 async function stopDeployment(deploymentId, userId) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
+  if (deployment.deploymentType === 'compose') {
+    if (deployment.localPath) {
+      await dockerComposeStop(deployment.localPath);
+    }
+    deployment.status = Deployment.Statuses.STOPPED;
+    deployment.errorMessage = null;
+    await deployment.save();
+    return deployment;
+  }
   if (!deployment.containerId) {
     deployment.status = Deployment.Statuses.STOPPED;
     deployment.errorMessage = null;
@@ -313,6 +483,32 @@ async function startDeployment(deploymentId, userId) {
     const err = new Error('Deployment is not in a stopped state');
     err.statusCode = 400;
     throw err;
+  }
+
+  if (deployment.deploymentType === 'compose') {
+    if (!deployment.localPath) {
+      deployment.status = Deployment.Statuses.FAILED;
+      deployment.errorMessage = 'Cannot start deployment: compose project path is missing.';
+      await deployment.save();
+      const err = new Error('Deployment has no compose project path');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    try {
+      await dockerComposeUp(deployment.localPath);
+      deployment.containerIds = await dockerComposeContainerIds(deployment.localPath);
+      deployment.containerId = deployment.containerIds[0] || null;
+      deployment.status = Deployment.Statuses.RUNNING;
+      deployment.errorMessage = null;
+      await deployment.save();
+      return deployment;
+    } catch (err) {
+      deployment.status = Deployment.Statuses.FAILED;
+      deployment.errorMessage = err && err.message ? String(err.message).slice(0, 1000) : 'Failed to start compose deployment';
+      await deployment.save();
+      throw err;
+    }
   }
 
   if (!deployment.containerId) {

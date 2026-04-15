@@ -1,10 +1,6 @@
-const { exec, spawn } = require('child_process');
-const { promisify } = require('util');
+const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs').promises;
 const net = require('net');
-
-const execAsync = promisify(exec);
 
 /** Base path for deployments - all paths must resolve under this (no path traversal) */
 const DEPLOYMENTS_BASE = path.resolve(process.cwd(), 'deployments');
@@ -28,16 +24,52 @@ function safeDeploymentPath(deploymentId) {
  * Execute Docker CLI with strict args - no user-controlled strings in shell.
  * Uses array form to avoid shell injection.
  */
-async function dockerExec(args) {
+async function runCommandCapture(binary, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...options,
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderrBuf += chunk.toString();
+    });
+
+    child.on('error', (err) => {
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout: stdoutBuf.trim(), stderr: stderrBuf.trim() });
+        return;
+      }
+      const error = new Error(stderrBuf.trim() || stdoutBuf.trim() || `Command failed with exit code ${code}`);
+      error.code = code;
+      reject(error);
+    });
+  });
+}
+
+async function dockerExec(args, options = {}) {
   const dockerPath = process.env.DOCKER_PATH || 'docker';
-  const cmd = [dockerPath, ...args].join(' ');
-  const { stdout, stderr } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
-  return { stdout: (stdout || '').trim(), stderr: (stderr || '').trim() };
+  return runCommandCapture(dockerPath, args, options);
 }
 
 function spawnDocker(args) {
   const dockerPath = process.env.DOCKER_PATH || 'docker';
   return spawn(dockerPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function composeExec(args, options = {}) {
+  return dockerExec(['compose', ...args], options);
 }
 
 // In-memory store for build logs keyed by deploymentId
@@ -276,6 +308,47 @@ async function dockerStats(containerId) {
   return JSON.parse(jsonText);
 }
 
+async function dockerComposeUp(projectPath) {
+  await composeExec(['up', '-d', '--compatibility'], { cwd: projectPath });
+}
+
+async function dockerComposeStop(projectPath) {
+  await composeExec(['stop'], { cwd: projectPath });
+}
+
+async function dockerComposeDown(projectPath) {
+  await composeExec(['down', '--rmi', 'local', '--remove-orphans'], { cwd: projectPath });
+}
+
+async function dockerComposeServiceNames(projectPath) {
+  const { stdout } = await composeExec(['config', '--services'], { cwd: projectPath });
+  if (!stdout) return [];
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function dockerComposeContainerIds(projectPath) {
+  const { stdout } = await composeExec(['ps', '-q'], { cwd: projectPath });
+  if (!stdout) return [];
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function dockerComposeLogs(projectPath, tail = 100) {
+  const tailNum = Math.min(Math.max(Number(tail) || 100, 1), 1000);
+  const { stdout, stderr } = await composeExec(['logs', '--tail', String(tailNum), '--no-color'], { cwd: projectPath });
+  return stdout + (stderr ? '\n' + stderr : '');
+}
+
+async function dockerComposePort(projectPath, serviceName, containerPort) {
+  const { stdout } = await composeExec(['port', serviceName, String(containerPort)], { cwd: projectPath });
+  return stdout;
+}
+
 async function pruneDanglingImages() {
   try {
     await dockerExec(['image', 'prune', '-f']);
@@ -304,4 +377,11 @@ module.exports = {
    pruneDanglingImages,
    getBuildLogsSnapshot,
    clearBuildLogs,
+  dockerComposeUp,
+  dockerComposeStop,
+  dockerComposeDown,
+  dockerComposeServiceNames,
+  dockerComposeContainerIds,
+  dockerComposeLogs,
+  dockerComposePort,
 };
