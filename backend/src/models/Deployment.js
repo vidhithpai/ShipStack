@@ -32,9 +32,13 @@ const deploymentSchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
+    servicePorts: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
     deploymentType: {
       type: String,
-      enum: ['generated', 'dockerfile', 'compose'],
+      enum: ['generated', 'dockerfile', 'compose', 'auto-compose'],
       default: 'generated',
     },
     assignedPort: {

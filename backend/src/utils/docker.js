@@ -309,7 +309,11 @@ async function dockerStats(containerId) {
 }
 
 async function dockerComposeUp(projectPath) {
-  await composeExec(['up', '-d', '--compatibility'], { cwd: projectPath });
+  const dockerPath = process.env.DOCKER_PATH || 'docker';
+  await runCommandCapture(dockerPath, ['compose', 'up', '-d', '--compatibility'], {
+    cwd: projectPath,
+    shell: true,
+  });
 }
 
 async function dockerComposeStop(projectPath) {

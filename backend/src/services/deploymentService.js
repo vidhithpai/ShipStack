@@ -176,6 +176,15 @@ async function fileExists(filePath) {
   }
 }
 
+async function pathIsDirectory(targetPath) {
+  try {
+    const st = await fs.stat(targetPath);
+    return st.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function detectDeploymentType(projectPath) {
   const composeYamlPath = path.join(projectPath, 'docker-compose.yml');
   const composeYmlAltPath = path.join(projectPath, 'docker-compose.yaml');
@@ -191,6 +200,37 @@ async function detectDeploymentType(projectPath) {
   const dockerfilePath = path.join(projectPath, 'Dockerfile');
   if (await fileExists(dockerfilePath)) {
     return { deploymentType: 'dockerfile', composeFilePath: null };
+  }
+
+  const frontendCandidates = ['frontend', 'client', 'web'];
+  const backendCandidates = ['backend', 'server', 'api'];
+  let frontendDirName = null;
+  let backendDirName = null;
+
+  for (const dirName of frontendCandidates) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await pathIsDirectory(path.join(projectPath, dirName))) {
+      frontendDirName = dirName;
+      break;
+    }
+  }
+  for (const dirName of backendCandidates) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await pathIsDirectory(path.join(projectPath, dirName))) {
+      backendDirName = dirName;
+      break;
+    }
+  }
+
+  if (frontendDirName && backendDirName) {
+    return {
+      deploymentType: 'auto-compose',
+      composeFilePath: path.join(projectPath, 'docker-compose.yml'),
+      frontendPath: path.join(projectPath, frontendDirName),
+      backendPath: path.join(projectPath, backendDirName),
+      frontendDirName,
+      backendDirName,
+    };
   }
 
   return { deploymentType: 'generated', composeFilePath: null };
@@ -264,6 +304,59 @@ async function resolveComposeHttpPort(projectPath, serviceNames) {
   return null;
 }
 
+async function detectStackForServicePath(servicePath) {
+  const packageJsonPath = path.join(servicePath, 'package.json');
+  if (await fileExists(packageJsonPath)) {
+    return { stackType: 'node', frameworkType: null };
+  }
+  if (await fileExists(path.join(servicePath, 'pom.xml'))) {
+    return { stackType: 'java-maven', frameworkType: null };
+  }
+  if (await fileExists(path.join(servicePath, 'requirements.txt'))) {
+    return { stackType: 'python', frameworkType: null };
+  }
+  return null;
+}
+
+async function ensureServiceDockerfile(servicePath) {
+  if (await fileExists(path.join(servicePath, 'Dockerfile'))) {
+    return;
+  }
+  const detectedStack = await detectStackForServicePath(servicePath);
+  if (!detectedStack || !detectedStack.stackType) {
+    throw new Error(`Unsupported service for auto-compose at ${path.basename(servicePath)}`);
+  }
+  const dockerfileContent = await generateDockerfile(detectedStack.stackType, INTERNAL_PORT);
+  await fs.writeFile(path.join(servicePath, 'Dockerfile'), dockerfileContent, 'utf8');
+}
+
+function buildAutoComposeContent({ backendDirName, frontendDirName, backendPort, frontendPort }) {
+  return `version: "3"
+
+services:
+  backend:
+    build: ./${backendDirName}
+    ports:
+      - "${backendPort}:3000"
+    networks:
+      - appnet
+
+  frontend:
+    build: ./${frontendDirName}
+    ports:
+      - "${frontendPort}:3000"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://backend:3000
+    networks:
+      - appnet
+
+networks:
+  appnet:
+`;
+}
+
 /**
  * Full deployment flow: validate URL, clone, prioritize compose/dockerfile, then fallback to generated Dockerfile.
  */
@@ -303,7 +396,14 @@ async function createDeployment(userId, repoUrlInput) {
       await fs.writeFile(dockerignorePath, dockerignoreContent, 'utf8');
     }
 
-    const { deploymentType, composeFilePath } = await detectDeploymentType(deploymentPath);
+    const {
+      deploymentType,
+      composeFilePath,
+      frontendPath,
+      backendPath,
+      frontendDirName,
+      backendDirName,
+    } = await detectDeploymentType(deploymentPath);
     deployment.deploymentType = deploymentType;
     deployment.frameworkType = null;
     await deployment.save();
@@ -321,6 +421,7 @@ async function createDeployment(userId, repoUrlInput) {
       deployment.containerIds = containerIds;
       deployment.containerId = containerIds[0] || null;
       deployment.assignedPort = assignedPort;
+      deployment.servicePorts = null;
       deployment.status = Deployment.Statuses.BUILDING;
       deployment.errorMessage = null;
       await deployment.save();
@@ -331,6 +432,48 @@ async function createDeployment(userId, repoUrlInput) {
         await sleep(minWaitMs);
         await performHttpHealthCheck(assignedPort);
       }
+    } else if (deploymentType === 'auto-compose') {
+      // Auto-compose is restricted to exactly frontend/backend services with no volumes/host-level features.
+      await ensureServiceDockerfile(backendPath);
+      await ensureServiceDockerfile(frontendPath);
+
+      const backendPort = await getNextAvailablePort();
+      const frontendPort = await getNextAvailablePort();
+      const generatedCompose = buildAutoComposeContent({
+        backendDirName,
+        frontendDirName,
+        backendPort,
+        frontendPort,
+      });
+      await fs.writeFile(composeFilePath, generatedCompose, 'utf8');
+      await validateComposeSecurity(composeFilePath);
+      await dockerComposeUp(deploymentPath);
+
+      const serviceNames = await dockerComposeServiceNames(deploymentPath);
+      const containerIds = await dockerComposeContainerIds(deploymentPath);
+
+      // Enforce security contract for generated compose: exactly two services.
+      const expectedServices = ['backend', 'frontend'];
+      const isExpectedShape =
+        serviceNames.length === 2 &&
+        serviceNames.every((serviceName) => expectedServices.includes(serviceName));
+      if (!isExpectedShape) {
+        throw new Error('Unsafe docker-compose configuration detected');
+      }
+
+      deployment.serviceNames = serviceNames;
+      deployment.containerIds = containerIds;
+      deployment.containerId = containerIds[0] || null;
+      deployment.assignedPort = frontendPort;
+      deployment.servicePorts = { backend: backendPort, frontend: frontendPort };
+      deployment.stackType = 'node';
+      deployment.status = Deployment.Statuses.BUILDING;
+      deployment.errorMessage = null;
+      await deployment.save();
+
+      const minWaitMs = parseInt(process.env.HEALTHCHECK_INITIAL_DELAY_MS || '2000', 10);
+      await sleep(minWaitMs);
+      await performHttpHealthCheck(frontendPort);
     } else {
       let stackTypeForBuild = deployment.stackType;
       if (deploymentType === 'generated') {
@@ -360,6 +503,7 @@ async function createDeployment(userId, repoUrlInput) {
       deployment.containerId = containerId;
       deployment.containerIds = containerId ? [containerId] : [];
       deployment.serviceNames = [];
+      deployment.servicePorts = null;
       deployment.stackType = stackTypeForBuild;
       deployment.assignedPort = assignedPort;
       deployment.status = Deployment.Statuses.BUILDING;
@@ -398,7 +542,7 @@ async function createDeployment(userId, repoUrlInput) {
  * Cleanup: stop container, remove container, remove image, delete folder, (caller removes DB entry if needed).
  */
 async function cleanupDeployment(deployment) {
-  if (deployment.deploymentType === 'compose' && deployment.localPath) {
+  if ((deployment.deploymentType === 'compose' || deployment.deploymentType === 'auto-compose') && deployment.localPath) {
     await dockerComposeDown(deployment.localPath).catch(() => {});
   }
 
@@ -428,7 +572,7 @@ async function cleanupDeployment(deployment) {
 async function getLogs(deploymentId, userId, tail) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
-  if (deployment.deploymentType === 'compose') {
+  if (deployment.deploymentType === 'compose' || deployment.deploymentType === 'auto-compose') {
     if (!deployment.localPath) return '';
     return dockerComposeLogs(deployment.localPath, tail);
   }
@@ -439,7 +583,7 @@ async function getLogs(deploymentId, userId, tail) {
 async function restartDeployment(deploymentId, userId) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
-  if (deployment.deploymentType === 'compose') {
+  if (deployment.deploymentType === 'compose' || deployment.deploymentType === 'auto-compose') {
     if (!deployment.localPath) {
       const err = new Error('No compose project path to restart');
       err.statusCode = 400;
@@ -469,7 +613,7 @@ async function restartDeployment(deploymentId, userId) {
 async function stopDeployment(deploymentId, userId) {
   const deployment = await Deployment.findOne({ _id: deploymentId, userId });
   if (!deployment) return null;
-  if (deployment.deploymentType === 'compose') {
+  if (deployment.deploymentType === 'compose' || deployment.deploymentType === 'auto-compose') {
     if (deployment.localPath) {
       await dockerComposeStop(deployment.localPath);
     }
@@ -501,7 +645,7 @@ async function startDeployment(deploymentId, userId) {
     throw err;
   }
 
-  if (deployment.deploymentType === 'compose') {
+  if (deployment.deploymentType === 'compose' || deployment.deploymentType === 'auto-compose') {
     if (!deployment.localPath) {
       deployment.status = Deployment.Statuses.FAILED;
       deployment.errorMessage = 'Cannot start deployment: compose project path is missing.';

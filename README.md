@@ -1,72 +1,122 @@
-# ShipStack
+# DeployMate
 
-Mini Platform-as-a-Service (PaaS) that runs locally and on AWS EC2. Deploy GitHub repos as Docker containers with one click.
+DeployMate is a container-based mini Platform-as-a-Service (PaaS) that lets users deploy public GitHub repositories automatically using Docker.
+
+It is built for fast, self-serve deployments with a clean backend orchestration layer and a lightweight React dashboard for managing live containers.
 
 ## Features
 
-- **Auth**: Register / Login with JWT
-- **Deploy**: Paste a GitHub repo URL → clone, detect stack (Node/Python/Java Maven), generate Dockerfile, build image, run container with 512m memory and 0.5 CPU
-- **Manage**: View status, logs, restart, stop, delete (container + image + folder + DB)
+- 🚀 Deploy public GitHub repositories in a few clicks
+- 🗂️ Root directory selection support for monorepo-style projects
+- 🧠 Automatic stack detection for Node.js, Python, and Java (Maven)
+- 🐳 Auto Dockerfile generation when no Dockerfile is provided
+- 📦 Support for user-provided `Dockerfile`
+- 🧩 Support for user-provided `docker-compose.yml` / `docker-compose.yaml`
+- 🏗️ Automatic docker-compose generation for frontend + backend monorepos
+- 🔄 Full container lifecycle management: start, stop, restart, delete
+- 📊 Deployment status tracking: `PENDING`, `BUILDING`, `RUNNING`, `FAILED`, `STOPPED`
+- 📜 Deployment and runtime logs streaming
+- ⚙️ Resource limits (CPU and memory) for container execution
+- 🔒 Secure Docker execution with restricted flags and validation rules
+
+## Deployment Logic
+
+DeployMate resolves deployment strategy in the following order:
+
+1. **If `docker-compose.yml` / `docker-compose.yaml` exists**  
+   Use the existing compose setup directly.
+
+2. **Else if root `Dockerfile` exists**  
+   Use the provided Dockerfile to build and run.
+
+3. **Else if frontend + backend folders are detected**  
+   Auto-generate service Dockerfiles (when missing), generate root `docker-compose.yml`, then deploy with Compose.
+
+4. **Else fallback to stack detection**  
+   Detect Node/Python/Java stack, generate Dockerfile from templates, then deploy.
 
 ## Tech Stack
 
-- **Backend**: Node.js, Express, MongoDB (Mongoose), JWT, Docker CLI (child_process)
-- **Frontend**: React (Vite), React Router, Axios
-- **Deployments**: Stored under `deployments/{deploymentId}`, Docker images `deploymate-{id}`
+- **Backend:** Node.js + Express
+- **Frontend:** React (Vite)
+- **Database:** MongoDB
+- **Containerization:** Docker
+- **Orchestration:** Docker Compose
+- **Deployment Target:** AWS EC2 (planned)
 
-## Prerequisites
+## Architecture
 
-- Node.js 18+
-- MongoDB running locally or `MONGODB_URI` set
-- Docker installed and running (for builds and runs)
-- Git (for cloning repos)
-
-## Quick Start
-
-### 1. Backend
-
-```bash
-cd backend
-cp .env.example .env
-# Edit .env: set JWT_SECRET, MONGODB_URI if needed
-npm install
-npm start
+```text
+User submits GitHub repository
+        ↓
+Backend clones repository
+        ↓
+Deployment type detection (compose / Dockerfile / auto-compose / generated)
+        ↓
+Build Docker image(s)
+        ↓
+Run container(s)
+        ↓
+Expose via assigned host port(s)
 ```
 
-Backend runs at `http://localhost:3000`. Deployments folder is `backend/deployments` (created automatically).
+## Security
 
-### 2. Frontend
+- Resource limits are enforced for single-container deployments (`--memory`, `--cpus`, `--pids-limit`)
+- Privileged container mode is blocked
+- Host network access is blocked
+- Unsafe compose directives are rejected before execution
+- GitHub URLs are validated and sanitized before clone
+- Docker commands are executed safely using controlled argument lists and spawn-based execution
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+## Local Setup
 
-Frontend runs at `http://localhost:5173` and proxies `/api` to the backend.
+1. Clone the repository
+   ```bash
+   git clone <your-repo-url>
+   cd ShipStack
+   ```
+2. Install backend dependencies
+   ```bash
+   cd backend
+   npm install
+   ```
+3. Start backend
+   ```bash
+   npm run dev
+   ```
+4. Start frontend
+   ```bash
+   cd ../frontend
+   npm install
+   npm run dev
+   ```
+5. Ensure Docker Engine/Desktop is running before creating deployments
 
-### 3. Use the app
+## Status and Lifecycle
 
-1. Open http://localhost:5173
-2. Register or log in
-3. New Deployment → enter a public GitHub repo URL (e.g. `https://github.com/owner/repo`)
-4. Wait for build; open the deployment to see logs and the app URL (e.g. http://localhost:3001)
+Each deployment is tracked with runtime metadata and container identifiers:
 
-## Environment (backend)
+- Status transitions: `PENDING` -> `BUILDING` -> `RUNNING` (or `FAILED`)
+- Supported lifecycle actions:
+  - **Start**
+  - **Stop**
+  - **Restart**
+  - **Delete**
+- Compose deployments support multi-service logs and coordinated stop/down operations
 
-| Variable        | Default                      | Description                |
-|----------------|------------------------------|----------------------------|
-| PORT           | 3000                         | Backend port               |
-| MONGODB_URI    | mongodb://localhost:27017/deploymate | MongoDB connection  |
-| JWT_SECRET     | (change in production)       | Secret for JWT signing     |
-| JWT_EXPIRES    | 7d                           | Token expiry               |
-| BASE_PORT      | 3001                         | First port for containers  |
-| INTERNAL_PORT  | 3000                         | Port inside container      |
+## Future Improvements
 
-## Project structure
+- 🔔 GitHub webhook-based auto redeploy
+- 🌐 Nginx reverse-proxy route management
+- ☸️ Multi-node deployments with Kubernetes
+- 🛠️ CI/CD integration for automated pipelines
+- 🌍 Subdomain-based per-deployment routing
 
-```
-shipstack/
+## Project Structure
+
+```text
+ShipStack/
 ├── backend/
 │   ├── src/
 │   │   ├── controllers/
@@ -74,27 +124,16 @@ shipstack/
 │   │   ├── routes/
 │   │   ├── models/
 │   │   ├── middleware/
-│   │   ├── utils/
-│   │   └── app.js
-│   ├── Dockerfile
+│   │   └── utils/
 │   └── package.json
 ├── frontend/
 │   ├── src/
-│   │   ├── pages/
-│   │   ├── components/
-│   │   └── services/
-│   ├── Dockerfile
 │   └── package.json
-├── templates/          # Dockerfile templates (node, python, java-maven)
-└── nginx/              # Optional reverse proxy config for EC2
+└── templates/
+    ├── node.template
+    ├── python.template
+    └── java-maven.template
 ```
-
-## Security notes
-
-- Only **github.com** HTTPS URLs are accepted; URLs are validated and sanitized.
-- Docker is invoked with explicit arguments (no user input in shell).
-- Deployment paths are constrained under `deployments/` with safe IDs.
-- Set a strong `JWT_SECRET` and use HTTPS in production.
 
 ## License
 
