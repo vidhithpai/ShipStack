@@ -199,17 +199,33 @@ async function detectDeploymentType(projectPath) {
 async function validateComposeSecurity(composeFilePath) {
   const raw = await fs.readFile(composeFilePath, 'utf8');
   const lower = raw.toLowerCase();
+  const unsafeMessage = 'Unsafe docker-compose configuration detected';
 
   if (/^\s*privileged\s*:\s*true\s*$/im.test(lower)) {
-    throw new Error('Unsafe docker-compose configuration detected');
+    throw new Error(unsafeMessage);
   }
   if (/^\s*network_mode\s*:\s*["']?host["']?\s*$/im.test(lower)) {
-    throw new Error('Unsafe docker-compose configuration detected');
+    throw new Error(unsafeMessage);
+  }
+  if (/^\s*pid\s*:\s*["']?host["']?\s*$/im.test(lower)) {
+    throw new Error(unsafeMessage);
+  }
+  if (/^\s*ipc\s*:\s*["']?host["']?\s*$/im.test(lower)) {
+    throw new Error(unsafeMessage);
   }
 
   // Reject obvious host root mounts in short/long volume syntaxes.
   if (/^\s*-\s*["']?\/\s*:[^#\n]+$/im.test(raw) || /^\s*source\s*:\s*["']?\/\s*$/im.test(raw)) {
-    throw new Error('Unsafe docker-compose configuration detected');
+    throw new Error(unsafeMessage);
+  }
+
+  // Reject host-level Docker daemon access and sensitive host filesystem mounts.
+  if (
+    /docker\.sock/i.test(raw) ||
+    /^\s*-\s*["']?\/(proc|sys|dev)\s*:[^#\n]+$/im.test(raw) ||
+    /^\s*source\s*:\s*["']?\/(proc|sys|dev)\s*["']?\s*$/im.test(raw)
+  ) {
+    throw new Error(unsafeMessage);
   }
 }
 
